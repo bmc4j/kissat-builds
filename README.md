@@ -41,13 +41,23 @@ binary per platform plus a `SHA256SUMS` file and `KISSAT-LICENSE`.
 Each built binary is smoke-checked with `kissat --version` (musl/arm in a container
 if the runner can't execute it natively).
 
-### windows-x64
+### windows-x64 — currently NOT shipped
 
 KISSAT has no official Windows build. This repo attempts a MinGW-w64 build under
-MSYS2; if it produces a working `kissat.exe` that runs `--version` it is shipped. If
-a release omits `kissat-windows-x64.exe`, the Windows build was not viable for that
-version and the other five platforms still ship — bmc4j treats kissat as optional
-per-platform and builds its windows-x64 engine jar without it.
+MSYS2; if it produces a working `kissat.exe` that runs `--version` it is shipped.
+
+**As of `rel-4.0.4` the MinGW-w64 build does not succeed:** kissat's `src/resources.c`
+unconditionally includes the POSIX header `sys/resource.h` (for `getrusage`-based
+timing/memory accounting), which MinGW-w64 does not provide, so compilation fails with
+`fatal error: sys/resource.h: No such file or directory`. Producing a Windows binary
+would require **modifying** kissat's source (a Win32 shim for the resource layer), which
+would violate this repo's unmodified-build guarantee. windows-x64 is therefore left as
+the one open platform.
+
+The other five platforms still ship — bmc4j treats kissat as optional per-platform and
+builds its windows-x64 engine jar without it. If a future kissat release adds Windows
+support (or a clean shim becomes available upstream), re-enabling it here is just a
+green windows-x64 job; nothing downstream changes.
 
 ## Building / cutting a release
 
