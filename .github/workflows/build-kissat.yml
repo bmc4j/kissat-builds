@@ -1,0 +1,169 @@
+name: Build kissat
+
+# Builds the KISSAT SAT solver from a pinned upstream tag once per platform and
+# publishes each binary as a release asset with a SHA256SUMS file. Mirrors the
+# bmc4j/jbmc-musl-builds "build-once-in-a-dedicated-repo, fetch+verify-downstream"
+# model. Public repo => free CI.
+#
+# KISSAT ships source only (MIT). Binaries are UNMODIFIED builds of the pinned
+# source (./configure && make). The MIT LICENSE travels with every asset.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kissatTag:
+        description: 'Upstream kissat tag to build (must match the README/commit pin).'
+        type: string
+        default: rel-4.0.4
+      releaseSuffix:
+        description: 'Release tag suffix; final release tag = kissat-<version>-<suffix>.'
+        type: string
+        default: r1
+
+permissions:
+  contents: write
+
+env:
+  KISSAT_TAG: ${{ inputs.kissatTag }}
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,     platform: linux-x64,   asset: kissat-linux-x64 }
+          - { runner: ubuntu-24.04-arm,  platform: linux-arm64,  asset: kissat-linux-arm64 }
+          - { runner: ubuntu-latest,     platform: linux-x64-musl, asset: kissat-linux-x64-musl }
+          - { runner: macos-15-intel,    platform: macos-x64,    asset: kissat-macos-x64 }
+          - { runner: macos-14,          platform: macos-arm64,  asset: kissat-macos-arm64 }
+          - { runner: windows-latest,    platform: windows-x64,  asset: kissat-windows-x64.exe }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      # ---- native POSIX builds (linux glibc x64/arm64, macOS x64/arm64) ----
+      - name: Build (native POSIX)
+        if: ${{ matrix.platform == 'linux-x64' || matrix.platform == 'linux-arm64' || matrix.platform == 'macos-x64' || matrix.platform == 'macos-arm64' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$KISSAT_TAG" https://github.com/arminbiere/kissat.git src
+          cd src
+          ./configure
+          make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp build/kissat "$GITHUB_WORKSPACE/out/${{ matrix.asset }}"
+          echo "Smoke check:"
+          build/kissat --version
+
+      # ---- linux-x64-musl: static build inside an alpine container ----
+      # Same model as the jbmc musl job: the runner is glibc, so build (and smoke)
+      # in a throwaway alpine container so the binary is musl-linked and proven to
+      # run under musl.
+      - name: Build (musl, alpine container)
+        if: ${{ matrix.platform == 'linux-x64-musl' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          docker run --rm -e KISSAT_TAG="$KISSAT_TAG" -v "$GITHUB_WORKSPACE/out:/out" alpine:3.20 sh -euc '
+            apk add --no-cache build-base git
+            git clone --depth 1 --branch "$KISSAT_TAG" https://github.com/arminbiere/kissat.git /src
+            cd /src
+            # Static link so the binary runs on any musl/Alpine host with no shared deps.
+            CFLAGS="-static" ./configure
+            make -j"$(nproc)"
+            cp build/kissat /out/kissat-linux-x64-musl
+            echo "Smoke check (musl):"
+            /out/kissat-linux-x64-musl --version
+          '
+
+      # ---- windows-x64: MinGW-w64 under MSYS2 (the known-hard platform) ----
+      - name: Set up MSYS2 (windows)
+        if: ${{ matrix.platform == 'windows-x64' }}
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            base-devel
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+
+      - name: Build (windows, MinGW-w64)
+        if: ${{ matrix.platform == 'windows-x64' }}
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$KISSAT_TAG" https://github.com/arminbiere/kissat.git src
+          cd src
+          # kissat's configure script assumes a POSIX-ish toolchain; MinGW provides one
+          # under MSYS2. If configure or make fails, the step fails and this asset is
+          # simply absent from the release (other 5 platforms unaffected).
+          ./configure
+          make -j"$(nproc)"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp build/kissat.exe "$GITHUB_WORKSPACE/out/kissat-windows-x64.exe" 2>/dev/null \
+            || cp build/kissat "$GITHUB_WORKSPACE/out/kissat-windows-x64.exe"
+          echo "Smoke check (windows):"
+          "$GITHUB_WORKSPACE/out/kissat-windows-x64.exe" --version
+
+      - name: Upload built binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    # Run even if the windows-x64 build failed, so the other platforms still ship.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for LICENSE)
+        uses: actions/checkout@v4
+
+      - name: Download all built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # download-artifact nests each under artifacts/<name>/<name>.
+          find artifacts -type f -print0 | while IFS= read -r -d '' f; do
+            cp "$f" "release/$(basename "$f")"
+          done
+          # The MIT license travels with the binaries.
+          cp LICENSE release/KISSAT-LICENSE
+          cd release
+          echo "Assets:"
+          ls -la
+          # SHA256SUMS over the binaries only (not the license).
+          sha256sum kissat-* > SHA256SUMS
+          echo "----- SHA256SUMS -----"
+          cat SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KISSAT_TAG: ${{ inputs.kissatTag }}
+          SUFFIX: ${{ inputs.releaseSuffix }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="kissat-${KISSAT_TAG#rel-}-${SUFFIX}"
+          notes="Unmodified builds of kissat ${KISSAT_TAG} (https://github.com/arminbiere/kissat), MIT-licensed. SHA-256 sums in SHA256SUMS; LICENSE in KISSAT-LICENSE."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release/* --clobber
+          else
+            gh release create "$tag" release/* --title "$tag" --notes "$notes"
+          fi
+          echo "Released $tag with:"
+          gh release view "$tag" --json assets --jq '.assets[].name'
